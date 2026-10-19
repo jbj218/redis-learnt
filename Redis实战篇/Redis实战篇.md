@@ -1882,6 +1882,8 @@ public  Result createVoucherOrder(Long voucherId) {
 3. intern()有啥作用？
 
    从字符串常量池取同一引用，保证相同值 → 同一对象 → 同一把锁
+   
+   
 
 但是以上代码还是存在问题，问题的原因在于当前方法被spring的事务控制，如果你在方法内部加锁，可能会导致当前方法事务还没有提交，但是锁已经释放，也会导致问题，所以我们选择将当前方法整体包裹起来，确保事务不会出现问题：如下：（具体解释看笔记，需先理解数据库中事务的机制）
 
@@ -2793,7 +2795,7 @@ private void init() {
    SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
 }
 // 用于线程池处理的任务
-// 当初始化完毕后，就会去从对列中去拿信息
+// 当初始化完毕后，就会去从队列中去拿信息
  private class VoucherOrderHandler implements Runnable{
 
         @Override
@@ -2816,7 +2818,7 @@ private void init() {
             // 2.创建锁对象
             RLock redisLock = redissonClient.getLock("lock:order:" + userId);
             // 3.尝试获取锁
-            boolean isLock = redisLock.lock();
+            boolean isLock = redisLock.trylock();
             // 4.判断是否获得锁成功
             if (!isLock) {
                 // 获取锁失败，直接返回失败或者重试
@@ -2975,6 +2977,12 @@ PubSub（发布订阅）是Redis2.0版本引入的消息传递模型。顾名思
 
 
 ### 7.4 Redis消息队列-基于Stream的消息队列
+
+Stream消息队列是==拉模式==，即消费方主动声明自己是那个消费者组的那个消费者然后到消息队列中拉取数据消费。
+
+之后学习的**RocketMQ**消息队列**在客户端 API 层面表现为"推模式"（Push Consumer），但底层实现是"长轮询拉模式"（Pull + Long Polling）。** 也就是说：**对用户是推，对底层是拉。**
+
+对大部分的RocketMQ直接理解成推模式即可。
 
 Stream 是 Redis 5.0 引入的一种新数据类型，可以实现一个功能非常完善的消息队列。
 
@@ -3174,7 +3182,7 @@ private class VoucherOrderHandler implements Runnable {
             try {
                 // 1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 >
                 List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-                    Consumer.from("g1", "c1"),
+                    Consumer.from("g1", "c1"),// // 我声明：我是 g1 组的 c1
                     StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
                     StreamOffset.create("stream.orders", ReadOffset.lastConsumed())
                 );
