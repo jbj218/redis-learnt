@@ -1867,13 +1867,248 @@ private class VoucherOrderHandler implements Runnable {
 
 ## 8、达人探店
 
-Set
+### 8.1点赞功能
 
-SortedSet
+初始代码
+
+~~~java
+@GetMapping("/like/{id}")
+public Result queryBlogLikes(@Pa	thVariable("id") Long id) {
+    //修改点赞数量
+    blogService.update().setSql("liked = liked +1 ").eq("id",id).update();
+    return Result.ok();
+}
+~~~
+
+#### 问题：
+
+这种方式会导致一个用户无限点赞，明显是不合理的
+
+#### 需求：
+
+* 同一个用户只能点赞一次，再次点击则取消点赞
+* 如果当前用户已经点赞，则点赞按钮高亮显示（前端已实现，判断字段Blog类的isLike属性）
+
+#### 解决：
+
+实现步骤：
+
+* 给Blog类中添加一个**isLike字段**，标示是否被当前用户点赞
+* 修改点赞功能，利用Redis的**set集**合判断是否点赞过，未点赞过则点赞数+1，已点赞过则点赞数-1
+* 修改根据id查询Blog的业务，判断当前登录用户是否点赞过，赋值给isLike字段
+* 修改分页查询Blog业务，判断当前登录用户是否点赞过，赋值给isLike字段
+
+注意：这个**isLike**不属于数据库中Blog表字段，使用了`@TableField(exist = false)`标记了。通过判断**redis**中博客用户点赞关系，来确定这个字段是true还是false。
+
+~~~java
+@TableField(exist = false)
+private Boolean isLike;
+~~~
+
+如果数据库中想要设计用户和博客的点赞关系，一个用户可以给多个博客点赞，一个博客可以被多个用户点赞。典型的多对多关系，用户表、博客表已近有了，所以想要建立关系，应该建立一个中间关系表user_blog。点赞时，写入中间关系表；获取点赞状态时，通过隐式或显示（推荐）来查询**具体某个博客被哪些用户点赞。**
+
+显示查询（JOIN,用的内连接）
+
+~~~sql
+select u.id
+from tb_user u 
+join user_blog ub on u.id=ub.user_id 
+join tb_blog b on b.id=ub.blog_id
+where b.id=？
+~~~
+
+隐式查询
+
+~~~sql
+select u.id
+form tb_user u,user_blog ub,tb_blog b
+where u.id=ub.user.id and b.id=ub.blog.id and b.id=？
+~~~
+
+#### 言归正传
+
+教程用了redis来缓存用户博客点赞关系，此时采用的是SET这种数据结构。`SISMEMBER`判断点赞关系
+
+key : `blog_id`
+
+value:  `userId`
+
+利用Redis的**set集**合判断是否点赞过
+
+~~~JAVA
+/**
+     * 判断登录用户是否点赞
+     * 若点赞将isLike设置为true
+     * @param blog
+     */
+    private void isBlogLiked(Blog blog) {
+        //1.获取登录用户
+        UserDTO user = UserHolder.getUser();
+        if (user==null) {
+            //1.1判断是否登录，若为null证明未登录状态,无需查询是否点赞
+            return;
+        }
+        Long userId = user.getId();
+        //2.判断是否点赞
+        Boolean isMember = stringRedisTemplate.opsForSet().isMember("blog:liked:"+ blog.getId(),userId.toString());
+        //3.若点赞，isLike设置为true
+        blog.setIsLike(BooleanUtil.isTrue(isMember));
+    }
+~~~
+
+未点赞过则点赞数+1，已点赞过则点赞数-1
+
+~~~java
+@Override
+    public Result likeBlog(Long id){
+        // 1.获取登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2.判断当前登录用户是否已经点赞
+        String key = BLOG_LIKED_KEY + id;
+        Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
+        if(BooleanUtil.isFalse(isMember)){
+             //3.如果未点赞，可以点赞
+            //3.1 数据库点赞数+1
+            boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
+            //3.2 保存用户到Redis的set集合
+            if(isSuccess){
+                stringRedisTemplate.opsForSet().add(key,userId.toString());
+            }
+        }else{
+             //4.如果已点赞，取消点赞
+            //4.1 数据库点赞数-1
+            boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
+            //4.2 把用户从Redis的set集合移除
+            if(isSuccess){
+                stringRedisTemplate.opsForSet().remove(key,userId.toString());
+            }
+        }
+~~~
+
+### 8.2点赞排行榜
+
+#### 需求
+
+在探店笔记的详情页面，应该把给该笔记点赞的人显示出来，比如最早点赞的TOP5，形成点赞排行榜：
+
+之前的点赞是放到set集合，但是set集合是不能排序的，所以这个时候，咱们可以采用一个可以排序的set集合，就是**SortedSet**
+
+**SortedSe**t中没有SISMEMBER命令来判断是否存在
+
+使用`ZSCORE key member` : 获取sorted set中的指定元素的score值;若为空则未点赞，非空点过赞
+
+#### 解决
+
+1、likeBlog改用SortedSet
+
+保存用户到Redis的set集合：  zadd key value score。这里的score用**时间戳**，这样就能**按照点赞先后排序**了。
+
+~~~java
+  @Override
+    public Result likeBlog(Long id) {
+        // 1.获取登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2.判断当前登录用户是否已经点赞
+        String key = BLOG_LIKED_KEY + id;
+        Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
+        if (score == null) {
+            // 3.如果未点赞，可以点赞
+            // 3.1.数据库点赞数 + 1
+            boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
+            // 3.2.保存用户到Redis的set集合  zadd key value score
+            if (isSuccess) {
+                stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());
+            }
+        } else {
+            // 4.如果已点赞，取消点赞
+            // 4.1.数据库点赞数 -1
+            boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
+            // 4.2.把用户从Redis的set集合移除
+            if (isSuccess) {
+                stringRedisTemplate.opsForZSet().remove(key, userId.toString());
+            }
+        }
+        return Result.ok();
+    }
+~~~
+
+2、获取点赞排行榜
+
+ZRANGE key min max：按照score排序后，获取==指定排名范围==内的元素
+
+ZRANGE KEY 0 4 获取点赞前5名的数据
+
+涉及知识点：
+
+- ZRANGE key min max
+- stream流
+- 方法引用
+- .last("ORDER BY FIELD(id," + idStr + ")")，IN返回顺序不保证，用ORDER BY FIELD指定返回顺序
+
+~~~java
+public Result queryBlogLikes(Long id) {
+    String key = BLOG_LIKED_KEY + id;
+    // 1.查询top5的点赞用户 zrange key 0 4
+    Set<String> top5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+    if (top5 == null || top5.isEmpty()) {
+        return Result.ok(Collections.emptyList());
+    }
+    // 2.解析出其中的用户id
+    List<Long> ids = top5.stream().map(Long::valueOf).collect(Collectors.toList());
+    String idStr = StrUtil.join(",", ids);
+    // 3.根据用户id查询用户 WHERE id IN ( 5 , 1 ) ORDER BY FIELD(id, 5, 1)
+    List<UserDTO> userDTOS = userService.query()
+            .in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list()
+            .stream()
+            .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+            .collect(Collectors.toList());
+    // 4.返回
+    return Result.ok(userDTOS);
+}
+~~~
+
+
 
 ## 9、好友关注
 
+### 9.1 好友关注-关注和取消关注
 
+#### 需求：
+
+针对用户的操作：可以对用户进行关注和取消关注功能。
+
+#### 解决：
+
+实现思路：
+
+需求：基于该表数据结构，实现两个接口：
+
+* 关注和取关接口
+* 判断是否关注的接口
+
+关注是User之间的关系，是博主与粉丝的关系，数据库中有一张tb_follow表来标示：
+
+![image-20261020114511356](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/image-20261020114511356.png)
+
+**tip:**学习过**自连接**查询后，其实这种**既当裁判又当参赛选手**的数据关系，完全可以用一张表来标识，tb_user表中直接加个字段follow_user_id。
+
+查询粉丝博主关系时：
+
+隐式：
+
+~~~sql
+select u1.user_id,u2.follow_user_id
+from tb_user u1 
+join tb_user u2 on u1.user_id=u2.follow_user_id
+~~~
+
+显式：
+
+~~~sql
+select u1.user_id,u2.follow_user_id
+from tb_user u1 ,tb_user u2
+where u1.user_id=u2.follow_user_id
+~~~
 
 ## 10、附近商铺
 
