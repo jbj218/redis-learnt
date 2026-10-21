@@ -3607,12 +3607,12 @@ public Result queryBlogLikes(Long id) {
 FollowController
 
 ```java
-//关注
+//传入关注状态，关注或取关
 @PutMapping("/{id}/{isFollow}")
 public Result follow(@PathVariable("id") Long followUserId, @PathVariable("isFollow") Boolean isFollow) {
     return followService.follow(followUserId, isFollow);
 }
-//取消关注
+//获取关注状态，返回关注状态
 @GetMapping("/or/not/{id}")
 public Result isFollow(@PathVariable("id") Long followUserId) {
       return followService.isFollow(followUserId);
@@ -3622,7 +3622,7 @@ public Result isFollow(@PathVariable("id") Long followUserId) {
 FollowService
 
 ```java
-取消关注service
+//获取关注状态
 @Override
 public Result isFollow(Long followUserId) {
         // 1.获取登录用户
@@ -3632,7 +3632,7 @@ public Result isFollow(Long followUserId) {
         // 3.判断
         return Result.ok(count > 0);
     }
-
+//根据关注状态 关注或取关
  关注service
  @Override
     public Result follow(Long followUserId, Boolean isFollow) {

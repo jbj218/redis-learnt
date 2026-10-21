@@ -2086,7 +2086,7 @@ public Result queryBlogLikes(Long id) {
 * 关注和取关接口
 * 判断是否关注的接口
 
-关注是User之间的关系，是博主与粉丝的关系，数据库中有一张tb_follow表来标示：
+关注是User之间的关系，是**博主**与**用户**的粉丝关系（多对多关系），数据库中有一张tb_follow表来标示：
 
 ![image-20261020114511356](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/image-20261020114511356.png)
 
@@ -2110,7 +2110,457 @@ from tb_user u1 ,tb_user u2
 where u1.user_id=u2.follow_user_id
 ~~~
 
+
+
+**实现两个功能**
+
+1. 获取登录用户的关注状态返回前端（前端：用于标识是否关注）
+2. 根据前端返回的关注状态 关注或取关（前端：点击按钮，如果关注了，点击一下取关；如果没关注，点击一下关注）
+
+~~~java
+//获取关注状态
+@Override
+public Result isFollow(Long followUserId) {
+        // 1.获取登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2.查询是否关注 select count(*) from tb_follow where user_id = ? and follow_user_id = ?
+        Integer count = query().eq("user_id", userId).eq("follow_user_id", followUserId).count();
+        // 3.判断
+        return Result.ok(count > 0);
+    }
+
+//根据关注状态 关注或取关
+ @Override
+    public Result follow(Long followUserId, Boolean isFollow) {
+        // 1.获取登录用户
+        Long userId = UserHolder.getUser().getId();
+        String key = "follows:" + userId;
+        // 1.判断到底是关注还是取关
+        if (isFollow) {
+            // 2.关注，新增数据
+            Follow follow = new Follow();
+            follow.setUserId(userId);
+            follow.setFollowUserId(followUserId);
+            boolean isSuccess = save(follow);
+
+        } else {
+            // 3.取关，删除 delete from tb_follow where user_id = ? and follow_user_id = ?
+            remove(new QueryWrapper<Follow>()
+                    .eq("user_id", userId).eq("follow_user_id", followUserId));
+
+        }
+        return Result.ok();
+    }
+~~~
+
+### 9.2好友关注-共同关注
+
+#### 需求：
+
+进入博主页面时，可以获取到博主和自己共同关注了哪些好友
+
+#### 解决：
+
+这里优先考虑用**redis**中的**SET**来存储博主被哪些人关注。
+
+单纯使用mysql可以做到获取共同关注吗？当然可以，但是你肯定要涉及多张表来建立建立连接关系，tb_follow就可以作为中间表
+
+当你想要实现共同关注时，就要注意到一个博主可以被多个粉丝关注，一个粉丝可以关注多个博主，**典型的多对多关系**。
+
+1、**用户表可以代表博主表和粉丝表**，**tb_follow表代表中间表**。
+
+2、确认表关系后，用mysql中的**内连接（[INNER] JOIN）**求交集即可。
+
+具体JOIN怎么做：
+
+注意：你**直接用博主表和粉丝表求交集是求不到的**，他俩没有直接关系。需要通过中间表建立联系后求。
+
+一、mysql层用sql直接获取(给其中一种实现方法)
+
+~~~sql
+-- 共同关注（A 和 B 都关注的人）
+SELECT u.id, u.nickname
+FROM tb_follow f1
+JOIN tb_follow f2 ON f1.follow_user_id = f2.follow_user_id
+JOIN tb_user u     ON u.id = f1.follow_user_id
+WHERE f1.user_id = ?   -- A 的 id
+  AND f2.user_id = ?;  -- B 的 id
+
+~~~
+
+二、mysql层用sql分别获取A关注了哪些人，B关注了哪些人。然后业务层自己手动遍历求交集
+
+~~~sql
+-- A 的关注列表
+SELECT u2.id
+FROM tb_user u1
+JOIN tb_follow f
+  ON u1.id = f.user_id
+JOIN tb_user u2
+  ON u2.id = f.follow_user_id
+WHERE u1.id = ?;
+
+
+-- B 的关注列表
+SELECT u1.id
+FROM tb_user u1
+JOIN tb_follow f
+  ON u1.id = f.user_id
+JOIN tb_user u2
+  ON u2.id = f.follow_user_id
+WHERE u2.id = ?;
+~~~
+
+业务层:有很多方法，比如用stream流遍历A，然后对每个A求`B.contains(A)`,即B中是否含有A中的某个值。
+~~~java
+List<Integer> result = a.stream()
+    .filter(b::contains)          // 对 a 的每个元素 x，判断 b.contains(x)
+    .collect(Collectors.toList());
+~~~
+
+**总结**：Mysql中这种多对多关系求交集真的很麻烦，而且join太多了性能很差，这也是为什么课程用redis的数据结构来求交集。
+
+#### 言归正传
+
+1、用redis的**SET**数据结构存储 **博主-所有关注者**的数据,博主id为key,关注者id为value。每次**关注或者取关**后将当下用户的数据**存入redis**中。
+
+2、获取共同关注时，用redis中的 SINTER key1 key2 ... ：求key1与key2的交集。只需要通过key就能很快获取共同的交集比mysql要方便很多。
+
+tip:第一步关注或取关的操作，按理说应该在redis和mysql中都要落库才对，这里**课程为了方便直接将落库mysql改成了落库redis**。
+
+**关注或取关时：**
+
+~~~java
+@Override
+public Result follow(Long followUserId, Boolean isFollow) {
+    // 1.获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    String key = "follows:" + userId;
+    // 1.判断到底是关注还是取关
+    if (isFollow) {
+        // 2.关注，新增数据
+        Follow follow = new Follow();
+        follow.setUserId(userId);
+        follow.setFollowUserId(followUserId);
+        boolean isSuccess = save(follow);
+        if (isSuccess) {
+            // 把关注用户的id，放入redis的set集合 sadd userId followerUserId
+            stringRedisTemplate.opsForSet().add(key, followUserId.toString());
+        }
+    } else {
+        // 3.取关，删除 delete from tb_follow where user_id = ? and follow_user_id = ?
+        boolean isSuccess = remove(new QueryWrapper<Follow>()
+                .eq("user_id", userId).eq("follow_user_id", followUserId));
+        if (isSuccess) {
+            // 把关注用户的id从Redis集合中移除
+            stringRedisTemplate.opsForSet().remove(key, followUserId.toString());
+        }
+    }
+    return Result.ok();
+}
+~~~
+
+**获取共同关注:**
+
+~~~java
+@Override
+public Result followCommons(Long id) {
+    // 1.获取当前用户
+    Long userId = UserHolder.getUser().getId();
+    String key = "follows:" + userId;
+    // 2.求交集
+    String key2 = "follows:" + id;
+    //SINTRE key key2
+    Set<String> intersect = stringRedisTemplate.opsForSet().intersect(key, key2);
+    if (intersect == null || intersect.isEmpty()) {
+        // 无交集
+        return Result.ok(Collections.emptyList());
+    }
+    // 3.解析id集合
+    List<Long> ids = intersect.stream().map(Long::valueOf).collect(Collectors.toList());
+    // 4.查询用户
+    List<UserDTO> users = userService.listByIds(ids)
+            .stream()
+            .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+            .collect(Collectors.toList());
+    return Result.ok(users);
+}
+~~~
+
+### 9.3好友关注-Feed流
+
+#### 概念：这里看实战教程更清楚
+
+当我们关注了用户后，这个用户发了动态，那么我们应该把这些数据推送给用户，这个需求，其实我们又把他叫做Feed流，关注推送也叫做Feed流，直译为投喂。为用户持续的提供“沉浸式”的体验，通过无限下拉刷新获取新的信息。
+
+Feed流的实现有两种模式：
+
+Feed流产品有两种常见模式：
+Timeline：不做内容筛选，简单的按照内容发布时间排序，常用于好友或关注。例如朋友圈
+
+* 优点：信息全面，不会有缺失。并且实现也相对简单
+* 缺点：信息噪音较多，用户不一定感兴趣，内容获取效率低
+
+智能排序：利用智能算法屏蔽掉违规的、用户不感兴趣的内容。推送用户感兴趣信息来吸引用户
+
+* 优点：投喂用户感兴趣信息，用户粘度很高，容易沉迷
+* 缺点：如果算法不精准，可能起到反作用
+  本例中的个人页面，是基于关注的好友来做Feed流，因此采用Timeline的模式。该模式的实现方案有三种：
+
+我们本次针对好友的操作，采用的就是Timeline的方式，只需要拿到我们关注用户的信息，然后按照时间排序即可
+
+，因此采用Timeline的模式。该模式的实现方案有三种：
+
+* 拉模式
+* 推模式
+* 推拉结合
+
+#### 拉模式：
+
+博主将博客放进自己的发件箱，用户获取的时候现读取到自己的收件箱
+
+#### 推模式：
+
+博主发布博客的时候直接推送到用户收件箱
+
+#### 推拉结合：
+
+大V角度：先写博客进发件箱，对活跃粉丝用推模式，对普通用户用拉模式
+
+普通用户角度：直接推模式
+
+### 9.4好友关注-推送到粉丝收件箱（推模式）
+
+#### 需求：
+
+* 修改新增探店笔记的业务，在保存blog到数据库的同时，推送到粉丝的收件箱
+* 收件箱满足可以根据时间戳排序，选择用Redis的数据结构SortedSet实现
+* 查询收件箱数据时，可以实现分页查询
+
+#### 思路：
+
+**推送内容**
+
+这里推送时，不会将整个博客内容推送到粉丝收件箱中，那样太消耗内存了，选择将博客id推送过去即可，粉丝看博客时按照推送过来的博客id查即可
+
+**key和value怎么选**
+
+推模式（当下）：一个粉丝一个粉丝箱中可以收到不同博主的博客，所以以**粉丝id为key,博客id为value，时间戳作为score**
+
+拉模式：博主有发件箱,一个博主对应一个发件箱可以发不同的博客，所以**发件箱中博主id为key，博客id为value,时间戳为score**;一个粉丝一个收件箱，读取信息时会从关注的不同博主中的收件箱信息全部拉过来，所以收件箱中**粉丝id为key,==博主id为value==**，查询时先根据博主id查询对应的博主发件箱，再从发件箱中拉去博客。
+
+#### 解决：
+
+保存博客时，查询博主粉丝，将笔记id推送给粉丝
+
+~~~java
+public Result saveBlog(Blog blog) {
+    // 1.获取登录用户
+    UserDTO user = UserHolder.getUser();
+    blog.setUserId(user.getId());
+    // 2.保存探店笔记
+    boolean isSuccess = save(blog);
+    if(!isSuccess){
+        return Result.fail("新增笔记失败!");
+    }
+    // 3.查询笔记作者的所有粉丝 select * from tb_follow where follow_user_id = ?
+    List<Follow> follows = followService.query().eq("follow_user_id", user.getId()).list();
+    // 4.推送笔记id给所有粉丝
+    for (Follow follow : follows) {
+        // 4.1.获取粉丝id
+        Long userId = follow.getUserId();
+        // 4.2.推送
+        String key = FEED_KEY + userId;
+        stringRedisTemplate.opsForZSet().add(key, blog.getId().toString(), System.currentTimeMillis());
+    }
+    // 5.返回id
+    return Result.ok(blog.getId());
+}
+~~~
+
+### 9.5好友关注-实现滚动分页查询
+
+#### 需求：
+
+首先我们业务需要的查询逻辑是，按照**时间戳大小从大往小查**，也就是说最新的会放在最前面。
+
+这就导致，数据的角标会从头开始往下挤。
+
+如果还按照原来的`ZREVGEBYSCORE key min max  [LIMIT offset count]`,说明一下这个命令，如果只带`min max`那就会返回这个范围内的所有数据，现实业务大概率不会这样，都会做分页查询，会带上`LIMIT offset count`表示跳过前offset位（不包括该位）查count个数据`(offset,offset+count] `。==这里还要注意，从那个起点开始跳过offset位呢？起点是max。==所以offset代表的是偏移量，==起点加偏移量才是下一次的起点==
+
+这里的起点max始终保持最大值，然后由offset来计算出每次的起点，**此时offset虽然是偏移量，但它代表了起点**。
+
+因为这里计算起点的方式是传统的`long offset = (long) (page - 1) * size;`,代表每次以固定的max起点来计算偏移量，但是步数固定，数据本身从max开始往下挤，导致会有重复的数据被读取。
+
+**固定索引分页查询**
+
+![ZSET分页重复读取问题](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/ZSET%E5%88%86%E9%A1%B5%E9%87%8D%E5%A4%8D%E8%AF%BB%E5%8F%96%E9%97%AE%E9%A2%98.gif)
+
+~~~java
+@Service
+public class ZSetPageService {
+
+    @Autowired
+    private StringRedisTemplate redis;
+
+    /**
+     * 按 score 降序分页
+     * @param key    zset key
+     * @param min    最小 score（含）
+     * @param max    最大 score（含）
+     * @param page   页码，从 1 开始
+     * @param size   每页条数
+     */
+    public Set<ZSetOperations.TypedTuple<String>> pageByScoreDesc(
+            String key, double min, double max, int page, int size) {
+        long offset = (long) (page - 1) * size;
+        return redis.opsForZSet()
+                .reverseRangeByScoreWithScores(key, min, max, offset, size);
+    }
+
+    // 升序版
+    public Set<ZSetOperations.TypedTuple<String>> pageByScoreAsc(
+            String key, double min, double max, int page, int size) {
+        long offset = (long) (page - 1) * size;
+        return redis.opsForZSet()
+                .rangeByScoreWithScores(key, min, max, offset, size);
+    }
+}
+~~~
+
+**滚动分页查询**
+
+如何查询这种向头插导致顺序变化的场景，且保证不重复查呢？
+
+这里关键是从源头出发，传统分页查询的起点一直是以第一个位置为起点，**以第一个位置为基准来计算偏移量得到每次查询的起点**。
+
+#### 解决：
+
+第一步：此时我不以第一个位置为起点了，第一次查询后得到查询到的最后一个位置，以这个位置为“起点”minTime返回前端用于定义下一次的max，此时按理说将偏移量offset设为1即可，因为**设为1即代表，跳过该起点本身，从起点的下一个开始查。**
+
+#### 解决：
+
+第二步：但是，有这么一种情况，本身我是以score来标定位置的。如果出现**同score**的情况，此时我返回score来表示最后一个位置，但我**下次查询时会以第一个出现改score的位置为起点，导致后面同分的score又被查了一遍**。
+
+ ① **同分边界**：`max` 会包含该分值的第一条记录
+
+场景：8 条博文，`b8`、`b7` 都是 **109 分**，每页 2 条。
+
+- 第 1 页 `max=+inf, offset=0` → 返回 **b8、b7**，`minTime=109`、`os=2`；
+- 如果只把 score 当作位置，下一次查询传入 `max=109, offset=0` 时，扫描会从 109 的第一条（b8）重新开始，于是 **b8、b7 又被返回一遍**；
+- 正确做法是带上 `offset = os = 2`，跳过这两条，返回 **b6、b5**。
+
+![同分场景-边界重复](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/%E5%90%8C%E5%88%86%E5%9C%BA%E6%99%AF-%E8%BE%B9%E7%95%8C%E9%87%8D%E5%A4%8D.gif)
+
+为了解决这个问题，需要使用os（计数器）来标记本次查询中，**最后的位置**分数出现重复时的score的数量（默认没有重复时数量为1），重复几个，下次就在此基础上偏移几。**os=offset**即可
+
+~~~java
+//3.2 获取 博文id 最小时间 偏移量
+        //最小时间
+        long minTime = 0;
+        //偏移量 （最小时间出现的次数）
+        Integer os = 1;
+        //博文id列表 （typedTuples.size()指定列表大小保持typedTuples长度一致）
+        ArrayList<Long> ids = new ArrayList(typedTuples.size());
+        for (ZSetOperations.TypedTuple<String> typedTuple : typedTuples) {
+            //博文id
+            ids.add(Long.valueOf(typedTuple.getValue()));
+            //score(时间戳) longValue() 转为long类型
+            long time = typedTuple.getScore().longValue();
+            if (time == minTime) {
+                os++;
+            } else {
+                minTime = time;
+            }
+        }
+	os=offset;//这一步需优化
+~~~
+
+#### 解决：
+
+第三步：又但是，有这么一种极度极端的情况，比如分数分布是：105 105|105 105|105 105,每次查两个。按照步骤二的思路，第一次查询，offset=2，minTime赋值给下一次的max；下一次查第二组数据，没毛病；第二次查询坏了，由于此时的minTime依旧等于最开始的第一组的时间max相同,此时又查到第一组的数据了。
+
+② 极端同分：整页同分时，`offset` 必须累加
+
+场景：6 条博文分数**全是 105**，`105 105 | 105 105 | 105 105`，每页 2 条。
+
+- 第 1 页 → b6、b5，`max=105, offset=2`；
+- 第 2 页 → b4、b3，此时 `minTime == max`，`os=2`；
+- 如果第 3 页仍用 `offset=2`，查询会退回第 2 页的起点，于是 **b4、b3 整页重复**；
+- 修复方法是 `offset = os + 上一页 offset = 2 + 2 = 4`，第 3 页返回 **b2、b1**；下一次 `2 + 4 = 6`，第 4 页返回空，滚动结束。
+
+![极端同分-整页重复](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/%E6%9E%81%E7%AB%AF%E5%90%8C%E5%88%86-%E6%95%B4%E9%A1%B5%E9%87%8D%E5%A4%8D.gif)
+
+为解决这个问题，要做极端场景的判断。如果minTime==本次的max(即上次的minTime)，就把本次计算出的os和上一次传进来的偏移量相加即可
+
+```java
+os = max == minTime ? os + offset : os;
+```
+
+![ZSET滚动分页流程](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/ZSET%E6%BB%9A%E5%8A%A8%E5%88%86%E9%A1%B5%E6%B5%81%E7%A8%8B.gif)
+
+~~~java
+public Result queryBlogOfFollow(Long max, Integer offset) {
+        //1.获取用户id
+        Long userId = UserHolder.getUser().getId();
+        String key = FEED_KEY + userId;
+        //2.根据用户id组成的key查询 value(博文id) score(时间戳)
+        //ZREVRANGEBYSCORE key Max Min LIMIT offset count (offset:下一此查询从新开头的第几个开始 count:一次查几条)
+        Set<ZSetOperations.TypedTuple<String>> typedTuples = stringRedisTemplate.opsForZSet()
+                .reverseRangeByScoreWithScores(key, 0, max, offset, 2);
+        //3.解析博文id 最小时间戳minTime 偏移量 os
+        //3.1非空判断
+        if (typedTuples == null || typedTuples.isEmpty()) {
+            //空：直接返回
+            return Result.ok();
+        }
+        //3.2 获取 博文id 最小时间 偏移量
+        //最小时间
+        long minTime = 0;
+        //偏移量 （最小时间出现的次数）
+        Integer os = 1;
+        //博文id列表 （typedTuples.size()指定列表大小保持typedTuples长度一致）
+        ArrayList<Long> ids = new ArrayList(typedTuples.size());
+        for (ZSetOperations.TypedTuple<String> typedTuple : typedTuples) {
+            //博文id
+            ids.add(Long.valueOf(typedTuple.getValue()));
+            //score(时间戳) longValue() 转为long类型
+            long time = typedTuple.getScore().longValue();
+            if (time == minTime) {//time要么递减要么不变
+                os++;
+            } else {//如果不等于一定是time变小了
+                minTime = time;
+            }
+        }
+        //解决同分极端场景 5 5 | 5 5 | 5，此时max=minTime，导致查到重复的数据
+        //如果minTime==max，说明最大的时间和计算出来的下次要查的最大时间（即minTime）是相同的，此时如果os还是2的话，就会导致重新查到第二组5 5 ，就这样一直重复查到
+        //解决办法就是如果出现minTime==max，就把本次计算出来的下次偏移量：“os”和本次传进来的偏移量：“offset”相加即可查到第三组5
+        os = max == minTime ? os + offset : os;
+        //4.根据id查blog
+        String idStr = StrUtil.join(",", ids);
+        List<Blog> blogs = query()
+                .in("id", ids)
+                .last("ORDER BY FIELD(id," + idStr + ")")
+                .list();
+        //4.1 blog中添加 博客对应的用户信息 博客是否被点赞信息
+        for (Blog blog : blogs) {
+            //添加博客对应的用户信息
+            queryBlogUser(blog);
+            //添加点赞信息
+            isBlogLiked(blog);
+        }
+        //5.封装并返回
+        ScrollResult scrollResult = new ScrollResult();
+        scrollResult.setList(blogs);
+        scrollResult.setMinTime(minTime);
+        scrollResult.setOffset(os);
+        return Result.ok(scrollResult);
+    }
+~~~
+
 ## 10、附近商铺
+
+
 
 ## 11、用户签到
 
