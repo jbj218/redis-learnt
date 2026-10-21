@@ -2560,8 +2560,494 @@ public Result queryBlogOfFollow(Long max, Integer offset) {
 
 ## 10、附近商铺
 
+### Redis地理位置类数据结构-GEO
 
+### 10.1 GEO基本用法
+
+* GEOADD：添加一个地理空间信息，包含：经度（longitude）、纬度（latitude）、值（member）
+* GEODIST：计算指定的两个点之间的距离并返回
+* GEOPOS：返回指定member的坐标。
+* GEOSEARCH：在指定**范围内**搜索member，并按照与指定点之间的距离**排序后返回**。范围可以是圆形或矩形。6.2.新功能
+* GEOSEARCHSTORE：与GEOSEARCH功能一致，不过可以把结果存储到一个指定的key。 6.2.新功能
+
+**举个例子**
+
+下面用一套**完整的城市数据**，把 `GEOADD / GEODIST / GEOPOS / GEOSEARCH / GEOSEARCHSTORE` 串起来演示。
+
+#### 一、准备数据：GEOADD
+
+```java
+# 语法：GEOADD key 经度 纬度 member [经度 纬度 member ...]
+GEOADD cities 116.40 39.90 "beijing"
+GEOADD cities 121.47 31.23 "shanghai"
+GEOADD cities 113.26 23.13 "guangzhou"
+GEOADD cities 114.06 22.54 "shenzhen"
+GEOADD cities 117.20 39.13 "tianjin"
+GEOADD cities 108.94 34.34 "xian"
+```
+
+- 经度在前（-180~180），纬度在后（-85.05~85.05），**顺序不能反**
+- 一个 key 下可以有很多 member，底层是 ZSet
+
+```java
+TYPE cities
+# zset
+ZCARD cities
+# 6
+```
+
+#### 二、查坐标：GEOPOS
+
+```java
+# 语法：GEOPOS key member [member ...]
+GEOPOS cities beijing shanghai
+```
+
+返回：
+
+```java
+1) 1) "116.39999896287918091"
+   2) "39.90000009167092543"
+2) 1) "121.47000110149383545"
+   2) "31.22999903975783554"
+```
+
+
+
+- 返回的是**数组**，每个 member 对应一组 `[经度, 纬度]`
+- 精度有浮点误差（正常现象）
+- member 不存在时对应位置返回 `nil`
+
+#### 三、算两点距离：GEODIST
+
+```java
+# 语法：GEODIST key member1 member2 [unit]
+# unit: m（默认）/ km / mi（英里）/ ft（英尺）
+GEODIST cities beijing tianjin
+# "111.65..."   默认单位米
+
+GEODIST cities beijing tianjin km
+# "111.65..."   km
+
+GEODIST cities beijing shanghai km
+# "1067.5..."
+```
+
+
+
+- 任意 member 不存在 → 返回 `nil`
+- 距离是**球面大圆距离**（Haversine），不是直线平面距离
+
+#### 四、范围搜索：GEOSEARCH（Redis 6.2+）
+
+##### 1. 圆形范围，按距离升序
+
+```java
+# 以北京为中心，1500km 半径内，按距离从近到远
+GEOSEARCH cities FROMMEMBER beijing BYRADIUS 1500 km ASC
+```
+
+返回：
+
+```text
+1) "beijing"
+2) "tianjin"
+3) "shanghai"
+```
+
+##### 2. 带距离和坐标
+
+```java
+GEOSEARCH cities FROMMEMBER beijing BYRADIUS 1500 km ASC
+    WITHDIST WITHCOORD
+```
+
+返回：
+
+```java
+1) 1) "beijing"
+   2) "0.0000"                    ← 距离
+   3) 1) "116.39999896287918091"  ← 经度
+      2) "39.90000009167092543"   ← 纬度
+2) 1) "tianjin"
+   2) "111.6547"
+   3) 1) "117.19999879598617554"
+      2) "39.12999974070185743"
+3) 1) "shanghai"
+   2) "1067.5482"
+   3) 1) "121.47000110149383545"
+      2) "31.22999903975783554"
+```
+
+
+
+##### 3. 降序 + 限制数量
+
+```java
+# 从远到近，只取 2 个
+GEOSEARCH cities FROMMEMBER beijing BYRADIUS 1500 km DESC COUNT 2
+# → shanghai, tianjin
+```
+
+
+
+##### 4. 以坐标为中心（不用 member）
+
+```java
+# 以天安门附近坐标为中心，300km 内
+GEOSEARCH cities FROMLONLAT 116.40 39.90 BYRADIUS 300 km ASC
+# → beijing, tianjin
+```
+
+
+
+##### 5. 矩形范围：BYBOX
+
+```java
+# 以北京为中心，宽 1200km、高 1200km 的矩形
+GEOSEARCH cities FROMMEMBER beijing BYBOX 1200 1200 km ASC
+```
+
+
+
+- `BYBOX 宽 高 单位`，宽是东西方向，高是南北方向
+
+##### 6. COUNT + ANY 加速
+
+```java
+# 只要凑够 2 个就返回，不保证是最近的，但快
+GEOSEARCH cities FROMMEMBER beijing BYRADIUS 1500 km ASC COUNT 2 ANY
+```
+
+#### 五、搜索并存储：GEOSEARCHSTORE（Redis 6.2+）
+
+#####  基本用法：结果存成 ZSet
+
+```java
+# 语法：GEOSEARCHSTORE destination source <查询条件> [STOREDIST]
+GEOSEARCHSTORE nearby cities FROMMEMBER beijing BYRADIUS 1500 km ASC
+# 返回 (integer) 3 nearby是存入的Zset的key
+```
+
+查一下存了什么：
+
+```java
+TYPE nearby
+# zset
+
+ZRANGE nearby WITHSCORES
+# 1) "beijing"    2) "4069091234567890"    ← score 是 geohash 编码
+# 3) "tianjin"    4) "406988..."
+# 5) "shanghai"   6) "406988..."
+```
+
+### 10.2 导入店铺数据
+
+首先，店铺的mysql数据中存入了经纬度和店铺类型。教程业务中，把店铺按照不同的类型做了分类，比如：美食类、健身类等等..
+
+![image-20261021163950547](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/image-20261021163950547.png)
+
+#### 需求：
+
+导入店铺数据时，需要按照店铺类型分块导入，但这些店铺在表结构上没有分表，只是用shop_type以作代替。
+
+#### 解决：
+
+1、按照店铺类型**分块获取**每种类型店铺各自的**经纬度及id**
+
+2、使用GEO导入redis
+
+涉及知识点：
+
+- Stream流中终结方法`collect(Collectors.groupingBy())`可以将流里的元素按照某个类型进行分类，分类结果以map的形式输出，其中key为被指定分类的元素，value为具体的数据。解决了第一步
+- ：GEOADD key 经度 纬度 member 
+
+~~~java
+@Test
+void loadShopData() {
+    // 1.查询店铺信息
+    List<Shop> list = shopService.list();
+    // 2.把店铺分组，按照typeId分组，typeId一致的放到一个集合
+    Map<Long, List<Shop>> map = list.stream().collect(Collectors.groupingBy(Shop::getTypeId));
+    // 3.分批完成写入Redis
+    for (Map.Entry<Long, List<Shop>> entry : map.entrySet()) {
+        // 3.1.获取类型id
+        Long typeId = entry.getKey();
+        String key = SHOP_GEO_KEY + typeId;
+        // 3.2.获取同类型的店铺的集合
+        List<Shop> value = entry.getValue();
+        List<RedisGeoCommands.GeoLocation<String>> locations = new ArrayList<>(value.size());
+        // 3.3.写入redis GEOADD key 经度 纬度 member
+        for (Shop shop : value) {
+            // stringRedisTemplate.opsForGeo().add(key, new Point(shop.getX(), shop.getY()), shop.getId().toString());
+            locations.add(new RedisGeoCommands.GeoLocation<>(
+                    shop.getId().toString(),
+                    new Point(shop.getX(), shop.getY())
+            ));
+        }
+        stringRedisTemplate.opsForGeo().add(key, locations);
+    }
+}
+~~~
+
+### 10.3 查询附近店铺功能
+
+#### 需求：
+
+当点击商铺具体类别时，获取当下位置周围的商铺信息，距离从近到远。
+
+![image-20261021213042766](C:\Users\沨烨\AppData\Roaming\Typora\typora-user-images\image-20261021213042766.png)
+
+![image-20261021213220961](C:\Users\沨烨\AppData\Roaming\Typora\typora-user-images\image-20261021213220961.png)
+
+#### 解决：
+
+首先前端此时发送的请求为：携带参数typeId类别id、current当下页码（查询数量后端定义好默认为5个）、x、y经纬度（为测试方便写死了）
+
+![image-20261021213331081](C:\Users\沨烨\AppData\Roaming\Typora\typora-user-images\image-20261021213331081.png)
+
+**具体怎么干：**
+
+1. 根据经纬度查询redis，获取当下页码对应的5个商铺id(member)和对应的距离，按照降序排列查出来
+
+2. 查出（id,distance）的map集合；查出有序的id集合
+
+3. 通过查出来的有序的商铺id列表在mysql中查出来对应有序的商铺信息，如图片、名称等信息传入对应的shop实体。通过map集合将对应的距离也写入shop实体中，返回shop实体。（这里的距离字段数据库是没有的，Shop类上进行了额外标注。）
+
+4. ~~~java
+   @TableField(exist = false)
+   private Double distance;
+   ~~~
+
+**代码实现：**
+
+~~~java
+public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        //1.判断是否根据坐标查询。这里业务需求是：可以不传经纬度，如果不传经纬度就直接分页查询5个返回。
+        if (x==null||y==null) {
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            return Result.ok(page.getRecords());
+        }
+        //否，直接查
+        //2.计算分页参数
+        int from=(current-1)*SystemConstants.DEFAULT_PAGE_SIZE;
+        int end=current*SystemConstants.DEFAULT_PAGE_SIZE;
+        //3.查询redis、按照距离排序、分页。结果：shopId、distance GEOSEARCH key FROMLONLAT x y BYRADIUS 10 WITHDISTANCE;
+        String key= SHOP_GEO_KEY+typeId;
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo().search(
+                key,
+                GeoReference.fromCoordinate(x, y),
+                new Distance(5000),
+                RedisGeoCommands.GeoSearchCommandArgs
+                        .newGeoSearchArgs()
+                        .includeDistance()//返回距离
+                        .limit(end)//最多end个
+        );
+        //4.解析
+        //健壮性判断
+        if (results==null) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        if(list.size()<=from){
+            // 没有下一页了，结束
+            return Result.ok(Collections.emptyList());
+        }
+        //4.1截取from-end 的数据
+        Map<Long, @NonNull Distance> distanceMap = list.stream()
+                .skip(from)
+                .collect(Collectors.toMap(result -> Long.valueOf(result.getContent().getName())
+                        , result -> result.getDistance()
+                        ,(a,b)->a)
+                        //,LinkedHashMap::new) // ← 第4个参数：按插入顺序的 Map
+                        );
+
+        //获取id集合
+        /* List<Long> ids=new ArrayList<>(list.size());
+        for (Long id : distanceMap.keySet()) {
+            ids.add(id);
+        }*/
+        //用重构方法更简单
+        ArrayList<Long> ids = new ArrayList<>(distanceMap.keySet());
+        //4.2查询数据库
+        String idStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+        //4.3 对应距离装进数据库
+        for (Shop shop : shops) {
+            Long shopId = shop.getId();
+            shop.setDistance(distanceMap.get(shopId).getValue());
+        }
+        //5.返回shop
+        return Result.ok(shops);
+    }
+~~~
+
+**代码解析：**
+
+**对应第一步：**查询距离当下坐标5km以内的最多**end**个的商铺id 、距离，以降序返回
+
+注意GEO查询是没有分页查询的功能的，没办法做到查询对应页数中的5个商铺，所以这里直接将页码*5的数据全部查出来，等用到时再截取。
+
+~~~java
+//2.计算分页参数
+        int from=(current-1)*SystemConstants.DEFAULT_PAGE_SIZE;
+        int end=current*SystemConstants.DEFAULT_PAGE_SIZE;
+        //3.查询redis、按照距离排序、分页。结果：shopId、distance GEOSEARCH key FROMLONLAT x y BYRADIUS 10 WITHDISTANCE;
+        String key= SHOP_GEO_KEY+typeId;
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo().search(
+                key,
+                GeoReference.fromCoordinate(x, y),
+                new Distance(5000),
+                RedisGeoCommands.GeoSearchCommandArgs
+                        .newGeoSearchArgs()
+                        .includeDistance()//返回距离
+                        .limit(end)//最多end个
+        );
+~~~
+
+**对应第二步：**查出（id,distance）的map集合；查出有序的id集合
+
+~~~java
+ //4.解析
+        //健壮性判断
+        if (results==null) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        if(list.size()<=from){
+            // 没有下一页了，结束
+            return Result.ok(Collections.emptyList());
+        }
+        //4.1截取from-end 的数据
+    Map<Long, @NonNull Distance> distanceMap = list.stream()
+                .skip(from)
+                .collect(Collectors.toMap(result -> Long.valueOf(result.getContent().getName())
+                        , result -> result.getDistance()
+                        ,(a,b)->a
+                        ,LinkedHashMap::new)// ← 第4个参数：按插入顺序的 Map
+                        );
+
+        //获取id集合
+        /* List<Long> ids=new ArrayList<>(list.size());
+        for (Long id : distanceMap.keySet()) {
+            ids.add(id);
+        }*/
+        //用重构方法更简单
+        ArrayList<Long> ids = new ArrayList<>(distanceMap.keySet());
+~~~
+
+解释一下这个stream流干了啥
+
+~~~java
+Map<Long, @NonNull Distance> distanceMap = list.stream()
+        .skip(from) // 跳过前 from 条（内存分页）
+        .collect(Collectors.toMap(
+                // key：商铺 id 转 Long
+                result -> Long.valueOf(result.getContent().getName()),
+                // value：距离对象
+                result -> result.getDistance(),
+                // 合并函数：遇到重复 key 时保留先出现的，防崩溃
+                (a, b) -> a,
+                // 使用 LinkedHashMap 保证 Map 遍历顺序与 list 一致
+                LinkedHashMap::new
+        ))
+~~~
+
+**对应第三步**：通过查出来的有序的商铺id列表在mysql中查出来对应有序的商铺信息，如图片、名称等信息传入对应的shop实体。通过map集合将对应的距离也写入shop实体中，返回shop实体。
+
+~~~java
+ //4.2查询数据库
+        String idStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+        //4.3 对应距离装进数据库
+        for (Shop shop : shops) {
+            Long shopId = shop.getId();
+            shop.setDistance(distanceMap.get(shopId).getValue());
+        }
+        //5.返回shop
+        return Result.ok(shops);
+~~~
 
 ## 11、用户签到
 
+### Redis位映射类数据结构-BITMAP
+
+教程原文档很详细，重点理解，bitmap如何输入，如何遍历。
+
+**bitmap输入：**
+
+~~~java
+@Override
+public Result sign() {
+    // 1.获取当前登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2.获取日期
+    LocalDateTime now = LocalDateTime.now();
+    // 3.拼接key
+    String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+    String key = USER_SIGN_KEY + userId + keySuffix;
+    // 4.获取今天是本月的第几天
+    int dayOfMonth = now.getDayOfMonth();
+    // 5.写入Redis SETBIT key offset 1
+    stringRedisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+    return Result.ok();
+}
+~~~
+
+![bitmap签到-写入](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/bitmap%E7%AD%BE%E5%88%B0-%E5%86%99%E5%85%A5.gif)
+
+**bitmap遍历：**用1做**位与**运算，每次**运算后右移一位**。结果位1该位为1，结果为0该位为0。
+
+~~~java
+@Override
+public Result signCount() {
+    // 1.获取当前登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2.获取日期
+    LocalDateTime now = LocalDateTime.now();
+    // 3.拼接key
+    String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+    String key = USER_SIGN_KEY + userId + keySuffix;
+    // 4.获取今天是本月的第几天
+    int dayOfMonth = now.getDayOfMonth();
+    // 5.获取本月截止今天为止的所有的签到记录，返回的是一个十进制的数字 BITFIELD sign:5:202203 GET u14 0
+    List<Long> result = stringRedisTemplate.opsForValue().bitField(
+            key,
+            BitFieldSubCommands.create()
+                    .get(BitFieldSubCommands.BitFieldType.unsigned(dayOfMonth)).valueAt(0)
+    );
+    if (result == null || result.isEmpty()) {
+        // 没有任何签到结果
+        return Result.ok(0);
+    }
+    Long num = result.get(0);
+    if (num == null || num == 0) {
+        return Result.ok(0);
+    }
+    // 6.循环遍历
+    int count = 0;
+    while (true) {
+        // 6.1.让这个数字与1做与运算，得到数字的最后一个bit位  // 判断这个bit位是否为0
+        if ((num & 1) == 0) {
+            // 如果为0，说明未签到，结束
+            break;
+        }else {
+            // 如果不为0，说明已签到，计数器+1
+            count++;
+        }
+        // 把数字右移一位，抛弃最后一个bit位，继续下一个bit位
+        num >>>= 1;
+    }
+    return Result.ok(count);
+}
+~~~
+
+![bitmap签到-统计](https://natureshiyi-image.oss-cn-hangzhou.aliyuncs.com/img/bitmap%E7%AD%BE%E5%88%B0-%E7%BB%9F%E8%AE%A1.gif)
+
 ## 12、UV统计
+
+### Redis数量统计类数据结构-HyperLogLog
+
+**HyperLogLog（HLL）功能**：估算一个集合中**“不重复元素的总数（基数）”**。（解决：**海量数据统计（UV）**）
