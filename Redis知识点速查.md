@@ -284,7 +284,7 @@ public class MvcConfig implements WebMvcConfigurer {
 
 2. Read/Write Through Pattern : 由系统本身完成，数据库与缓存的问题交由系统本身去处理
 
-3. Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步处理数据库，实现最终一致
+3. Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步处理数据库，实现最终一致（秒杀业务）
 
 **1、用第一种双写一致方案**
 
@@ -337,8 +337,6 @@ public class MvcConfig implements WebMvcConfigurer {
  t4    查DB→读到【旧值10】(A在B更新前就发起了查库)
  t5    把【旧值10】写回缓存           缓存=10 ❌
 ```
-
-
 
 **条件很苛刻**：读线程A在线程B更新之前读到旧值，且直到B线程更新数据库加删缓存操作完后，线程A才执行到写缓存的操作，此时缓存是旧值，数据库新值。
 
@@ -3051,3 +3049,237 @@ public Result signCount() {
 ### Redis数量统计类数据结构-HyperLogLog
 
 **HyperLogLog（HLL）功能**：估算一个集合中**“不重复元素的总数（基数）”**。（解决：**海量数据统计（UV）**）
+
+# 技术拓展
+
+## 1.JWT验证登录
+
+### 1.1 JWT介绍
+
+#### 一句话：JWT 是「自带签名的身份证」
+
+传统的 Session 是：服务端存一张表（`sessionId → 用户信息`），客户端只拿一个毫无意义的 ID。
+
+JWT 反过来：**用户信息直接写在令牌里，服务端靠一个密钥验证"这令牌是不是我签发的"**，不需要存任何东西。
+
+------
+
+#### 结构：三段，用 `.` 隔开
+
+```java
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 . eyJzdWIiOiIxMDAxIiwiZXhwIjoxNzMwMDAwMDAwfQ . 4kQ2s...
+        ↑ Header（头）                        ↑ Payload（载荷）                    ↑ Signature（签名）
+```
+
+#### 第一段 Header：用什么算法签的
+
+Base64Url 解码后：
+
+```json
+{"alg":"HS256","typ":"JWT"}
+```
+
+#### 第二段 Payload：装了什么数据
+
+```json
+{
+  "sub": "1001",        ← subject，一般放 userId
+  "role": "user",
+  "exp": 1730000000,    ← 过期时间戳（秒）
+  "iat": 1729998200     ← 签发时间
+}
+```
+
+**你可以往里塞任意字段**，比如 `{"userId":1001,"nickname":"沨烨"}`。
+
+#### 第三段 Signature：防伪的核心
+
+```java
+signature = HMACSHA256(
+    base64(header) + "." + base64(payload),
+    服务端保管的密钥
+)
+```
+
+**关键点：签名需要密钥，而密钥只在服务端。** 所以：
+
+- 攻击者能改 payload（它是明文），但**改完签名就对不上了**
+- 攻击者能伪造一个新 payload，但没有密钥，**签不出合法的 signature**
+
+### 1.2 JWT实战使用
+
+主要就两个步骤
+
+- 生成`JWTToken`返回前端(传入Header、Payload、Signature用于生成)
+- 解析前端发送来的`JWTToken`进行验证
+
+**生成时一般用于用户进行登录后返回给前端，解析时一般用于是拦截器端获取JWTToken进行登录状态验证、身份验证等**
+
+
+
+pom.xml
+
+~~~xml
+ <!--JWT        -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+            <version>0.12.6</version>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <version>0.12.6</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <version>0.12.6</version>
+            <scope>runtime</scope>
+~~~
+
+把jwt生成token和解析token做成工具类以便调用
+
+//注意密钥用`Keys.hmacShaKeyFor`生成时定义的字符数量要超过32位
+
+~~~java
+public class JWTUtils {
+
+    /**
+     * 密钥。
+     * HS256 要求至少 32 字节（256 bit），这里字符串是 40 个字符，够用。
+     * Keys.hmacShaKeyFor() 会把 byte[] 包装成 HMAC 用的 SecretKey。
+     */
+    private static final SecretKey SECRET_KEY =
+            Keys.hmacShaKeyFor("secretkeysecretkeysecretkey1234567890".getBytes());
+
+    /**
+     * 生成 token。
+     * 返回的字符串长这样：header.payload.signature（三段，用 . 隔开）
+     */
+    public static String createToken(UserDTO user) {
+
+        JwtBuilder builder = Jwts.builder();   // ① 拿到构建器，此时还是空的
+
+        String JWTtoken = builder
+                // ---------- ② Header（头）：说明用什么算法 ----------
+                .setHeaderParam("type", "JWT")          // 声明这是个 JWT
+                .setHeaderParam("alg", "HS256")         // 声明签名算法是 HS256
+
+                // ---------- ③ Payload（载荷）：装业务数据 ----------
+                .setSubject("user")                     // sub 字段，这里填的是字符串 "user"
+                .claim("id", user.getId().longValue())  // 自定义字段 id
+                .claim("nickname", user.getNickName())  // 自定义字段昵称
+                .claim("icon", user.getIcon())          // 自定义字段头像地址
+                .setIssuedAt(new Date())                // iat：签发时间，现在就发
+                .setExpiration(new Date(
+                        System.currentTimeMillis() + 8 * 60 * 60 * 1000))
+                                                        // exp：8 小时后过期
+                                                        // 8*60*60*1000 = 28,800,000 毫秒
+
+                // ---------- ④ Signature（签名）：防伪 ----------
+                .signWith(SignatureAlgorithm.HS256, SECRET_KEY)
+                // 用密钥对 "base64(header).base64(payload)" 算一遍 HMAC-SHA256
+                // 结果贴在最后一段
+
+                .compact();                             // ⑤ 拼成最终字符串
+
+        return JWTtoken;
+    }
+
+    /**
+     * 解析 token。
+     * 做了三件事：验签 → 校验过期 → 把 payload 反序列化成 Claims
+     * 任何一步失败都会抛 JwtException 的子类，调用方必须捕获。
+     */
+    public static Claims parseToken(String JWTToken) {
+        return Jwts.parser()
+                .verifyWith(SECRET_KEY)          // 用什么密钥验签
+                .build()                          // 构建出解析器
+                .parseSignedClaims(JWTToken)      // 拆三段 + 验签 + 查过期
+                .getPayload();                    // 取出 payload
+    }
+}
+~~~
+
+
+
+**使用：**
+
+#### 登录后生成token返回
+
+~~~java
+public Result loginWithJWT(LoginFormDTO loginForm, HttpSession session) {
+        //1.验证手机格式
+        String phone = loginForm.getPhone();
+        if (RegexUtils.isPhoneInvalid(phone)) {
+            //2.不符合返回错误信息
+            return Result.fail("手机号格式错误！");
+        }
+
+        //3.从redis中获取验证码并校验
+        String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
+        String code = loginForm.getCode();
+        if (cacheCode == null || !cacheCode.toString().equals(code)) {
+            //3.1不一致报错
+            return Result.fail("验证码错误");
+        }
+        //3.2一致，根据手机号查用户
+        User user = query().eq("phone", phone).one();
+        //4.判断用户是否存在
+        if (user == null) {
+            //4.1不存在注册新用户，数据保存到数据库
+            user = createUserWithPhone(phone);
+        }
+        //5.格式转换，User->UserDTO
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        //6.通过JWT生成token
+        String token = JWTUtils.createToken(userDTO);
+        return Result.ok(token) ;
+    }
+
+~~~
+
+#### 定义拦截器拦截解析
+
+~~~java
+package com.hmdp.utils;
+
+import com.hmdp.dto.UserDTO;
+import io.jsonwebtoken.Claims;
+import org.springframework.lang.Nullable;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+public class JWTInterceptor implements HandlerInterceptor {
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        String token = request.getHeader("Authorization");
+        if (token == null){
+            return false; // Token is missing
+        }
+        //解析token
+        Claims claims = JWTUtils.parseToken(token);
+        if(claims == null){
+            return false; // Token is invalid
+        }
+        //保存用户信息到ThreadLocal
+        UserDTO userDTO = new UserDTO();
+        userDTO.setId(claims.get("id", Long.class));
+        userDTO.setNickName(claims.get("nickname", String.class));
+        userDTO.setIcon(claims.get("icon", String.class));
+        UserHolder.saveUser(userDTO);
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, @Nullable Exception ex) throws Exception {
+        UserHolder.removeUser();
+    }
+}
+
+~~~
+
