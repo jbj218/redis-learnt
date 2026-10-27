@@ -3283,3 +3283,176 @@ public class JWTInterceptor implements HandlerInterceptor {
 
 ~~~
 
+## 2.定时任务
+
+### 一、最小可用示例（3 步）
+
+```java
+// ① 启动类上加注解，开启定时任务
+@SpringBootApplication
+@EnableScheduling          // ← 少了这个，所有 @Scheduled 都不会跑
+public class Application { ... }
+
+// ② 写一个 Bean，方法上加 @Scheduled
+@Component
+public class MyJob {
+
+    @Scheduled(cron = "0 0 2 * * ?")     // 每天凌晨 2 点
+    public void cleanExpiredOrders() {
+        log.info("开始清理过期订单");
+    }
+}
+```
+
+**注意方法必须是 `public void`、无参、且所在的类是 Spring Bean。**
+
+------
+
+### 二、四种触发方式
+
+| 写法                   | 含义                      | 什么时候用                     |
+| ---------------------- | ------------------------- | ------------------------------ |
+| `fixedRate = 5000`     | 上一次**开始**后 5 秒再跑 | 要求"固定频率"，比如每秒采样   |
+| `fixedDelay = 5000`    | 上一次**结束**后 5 秒再跑 | **最常用**，保证任务之间有喘息 |
+| `initialDelay = 30000` | 首次延迟 30 秒            | 配合上面两个用，避开启动期     |
+| `cron = "0 0 2 * * ?"` | 按日历表达式              | 要"每天几点"这种精确时间       |
+
+### 三、定时任务默认线程
+
+**Spring Boot 的定时任务默认线程池大小是 1。**也就是说如果有多个定时任务，那么他们就是排队执行，共用这一个线程
+
+**方式一：改配置（最简单）**
+
+```yml
+spring:
+  task:
+    scheduling:
+      pool:
+        size: 5                       # 线程数
+      thread-name-prefix: sched-
+      shutdown:
+        await-termination: true       # 停机时等任务跑完
+        await-termination-period: 30s
+```
+
+**方式二：Java 配置（更灵活）**
+
+```java
+@Configuration
+@EnableScheduling
+public class ScheduleConfig implements SchedulingConfigurer {
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar registrar) {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(5);
+        scheduler.setThreadNamePrefix("sched-");
+        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        scheduler.setAwaitTerminationSeconds(30);
+        scheduler.initialize();
+        registrar.setTaskScheduler(scheduler);
+    }
+}
+```
+
+### 四、多实例会重复执行
+
+`@Scheduled` 是**进程内**的调度。
+
+```
+部署 2 台服务器 → 同一个任务在 2 台机器上各跑一遍 → 数据重复处理
+```
+
+**你的对账任务如果跑两边：**
+
+```
+机器A：扫到 orderId=X，回滚库存
+机器B：也扫到 orderId=X，又回滚一次
+```
+
+虽然 `release()` 有 `ZREM` 做 CAS 兜底，但**多做了无谓的工作，还可能触发别的并发问题**。
+
+#### 三种解决方案
+
+| 方案                     | 做法                                  | 适用           |
+| ------------------------ | ------------------------------------- | -------------- |
+| **分布式锁**（最常用）   | 抢到 Redis 锁才执行                   | 临时方案，简单 |
+| **只在一台跑**           | 配置中心指定 `job.node`，不匹配就跳过 | 简单但不够灵活 |
+| **调度中心**（正经方案） | XXL-JOB / ElasticJob，统一调度        | 生产环境       |
+
+分布式锁写法：
+
+```java
+@Scheduled(fixedDelay = 60_000)
+public void reconcile() {
+    String lockKey = "lock:reconcile";
+    String token = UUID.randomUUID().toString();
+
+    // SET NX EX 30 —— 抢到锁才执行
+    Boolean locked = redis.opsForValue()
+            .setIfAbsent(lockKey, token, Duration.ofSeconds(30));
+    if (!Boolean.TRUE.equals(locked)) {
+        return;                     // 别的实例在跑
+    }
+
+    try {
+        doReconcile();
+    } finally {
+        // 用完释放（生产要用 Lua 校验 token 再删）
+        redis.delete(lockKey);
+    }
+}
+```
+
+### 五、异常不会中断调度
+
+```java
+@Scheduled(fixedDelay = 5000)
+public void bad() {
+    throw new RuntimeException("炸了");
+}
+```
+
+Spring 会打一条错误日志，**5 秒后继续跑**。
+
+但这会带来一个问题：**任务一直失败，日志一直刷，没人发现**。所以：
+
+```java
+@Scheduled(fixedDelay = 5000)
+public void job() {
+    try {
+        doSomething();
+    } catch (Exception e) {
+        log.error("任务失败", e);
+        // 这里可以加告警
+    }
+}
+```
+
+**自己 try-catch，比让框架兜着更容易观察。**
+
+------
+
+### 六、优雅停机
+
+不加配置的话，`kill` 服务时正在跑的任务会被直接掐断：
+
+ymal配置
+
+```yml
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s     # 给停机留 30 秒
+
+server:
+  shutdown: graceful                    # 优雅停机
+```
+
+java配置
+
+```java
+scheduler.setWaitForTasksToCompleteOnShutdown(true);   // 等任务跑完再关线程池
+scheduler.setAwaitTerminationSeconds(30);
+```
+
+**比如对账任务**——跑到一半被 kill，可能留下"回滚了一半"的状态。
