@@ -3137,6 +3137,7 @@ pom.xml
             <artifactId>jjwt-jackson</artifactId>
             <version>0.12.6</version>
             <scope>runtime</scope>
+            </dependency>
 ~~~
 
 把jwt生成token和解析token做成工具类以便调用

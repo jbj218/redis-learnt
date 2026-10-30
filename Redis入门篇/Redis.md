@@ -1094,6 +1094,35 @@ SortedSet的常见命令有：
 - **升序**获取sorted set 中的指定元素的排名：ZRANK key member
 - **降序**获取sorted set 中的指定元素的排名：ZREVRANK key memeber
 
+### 4.9 Redis命令-Time类型
+
+##### redis命令
+
+~~~redis
+127.0.0.1:6379> Time
+1) "1793347849"
+2) "183462"
+~~~
+
+##### lua
+
+~~~lua
+local t = redis.call('TIME')//获取一个数组，t[1]代表秒 T[2]代表向下秒对应走了多少微秒。字符串类型
+local nowMs = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)//字符串转转毫秒
+~~~
+
+~~~lua
+local t = redis.call('TIME')
+-- t = ["1793346810", "44968"]
+--      └─ 秒              └─ 微秒（0~999999）
+~~~
+
+~~~java
+local nowMs = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+              └──────┬──────┘        └──────┬──────┘
+                  ① 秒转毫秒              ② 微秒转毫秒并取整
+~~~
+
 
 
 ## 5.Redis的Java客户端-Jedis
